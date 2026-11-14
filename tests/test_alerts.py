@@ -452,3 +452,62 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Robinhood(unittest.TestCase):
+    RH = os.path.join(QDIR, "robinhood-TSLA.json")
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def test_parse_picks_the_newer_trade(self):
+        with open(self.RH) as fh:
+            q = alerts.parse_robinhood(fh.read(), "tsla")
+        # Fri 2026-11-13: the 20:59:59Z regular trade 390.1401, then 387.1093 after hours at 00:59:59Z
+        self.assertEqual(q["price"], 387.1093)
+        self.assertEqual(q["time"], "2026-11-14T00:59:59Z")
+        self.assertEqual(q["prev_close"], 397.45)
+        self.assertEqual(q["source"], "robinhood")
+        with open(self.RH) as fh:
+            doc = json.load(fh)
+        doc["data"]["results"][0]["quote"]["venue_last_non_reg_trade_time"] = "2026-11-13T12:00:00.000000000Z"
+        self.assertEqual(alerts.parse_robinhood(json.dumps(doc), "TSLA")["price"], 390.1401)
+
+    def test_quote_from_a_saved_file_or_folder(self):
+        for offline in (self.RH, QDIR):
+            code, text, err = run(["quote", "TSLA", "--source", "robinhood", "--offline", offline])
+            self.assertEqual(code, 0, err)
+            self.assertIn("TSLA   $387.11", text)
+            self.assertIn("[robinhood]", text)
+
+    def test_stop_rings_on_a_robinhood_price(self):
+        rules = os.path.join(self.d, "alerts.json")
+        state = os.path.join(self.d, "state.json")
+        self.assertEqual(run(["add", "--rules", rules, "--symbol", "TSLA", "--stop", "388"])[0], 0)
+        code, text, err = run(["check", "--rules", rules, "--state", state, "--prices-out",
+                               os.path.join(self.d, "prices.json"), "--source", "robinhood", "--offline", self.RH,
+                               "--now", "2026-11-13 19:00"])
+        self.assertEqual(code, 0, err + text)
+        self.assertIn("TSLA", text)
+        with open(os.path.join(self.d, "prices.json")) as fh:
+            p = json.load(fh)
+        self.assertEqual((p["prices"]["TSLA"], p["source"]), (387.1093, "robinhood"))
+
+    def test_refusals(self):
+        code, _, err = run(["quote", "TSLA", "--source", "robinhood"])
+        self.assertEqual(code, 1)
+        self.assertIn("give --offline FILE", err)
+        code, text, err = run(["quote", "NVDA", "--source", "robinhood", "--offline", self.RH])
+        self.assertIn("has no NVDA", text + err)
+        with open(self.RH) as fh:
+            doc = json.load(fh)
+        doc["data"]["results"][0]["quote"]["state"] = "inactive"
+        p = os.path.join(self.d, "rh.json")
+        with open(p, "w") as fh:
+            json.dump(doc, fh)
+        code, text, err = run(["quote", "TSLA", "--source", "robinhood", "--offline", p])
+        self.assertIn("no live price", text + err)
+        self.assertNotIn("Traceback", text + err)

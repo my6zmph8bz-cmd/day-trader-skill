@@ -331,6 +331,69 @@ def parse_chart(text, sym):
             "data_time": meta.get("regularMarketTime")}
 
 
+SOURCES = {"yahoo": "Yahoo, free, can lag", "robinhood": "Robinhood bars saved from the connector"}
+SOURCE_NAME = {"yahoo": "Yahoo", "robinhood": "Robinhood"}
+RH_INTERVALS = {"5minute": "5m", "minute": "1m"}
+
+
+def rh_time(text):
+    """Robinhood's begins_at ("2026-11-13T14:30:00Z") -> epoch seconds."""
+    t = str(text).strip().replace("Z", "+00:00")
+    if "." in t:                                  # trim nanoseconds to what fromisoformat takes
+        head, rest = t.split(".", 1)
+        frac = re.match(r"\d*", rest).group(0)
+        t = head + "." + frac[:6].ljust(6, "0") + rest[len(frac):]
+    d = datetime.datetime.fromisoformat(t)
+    if d.tzinfo is not None:
+        d = (d - d.utcoffset()).replace(tzinfo=None)
+    return int((d - EPOCH).total_seconds())
+
+
+def parse_robinhood(text, sym):
+    """The Robinhood connector's get_equity_historicals output, saved as returned
+    ({"data": {"results": [{"symbol", "interval", "bars": [...]}]}}) -> the same
+    shape as parse_chart. Only completed bars come back, so the data reaches the
+    last bar's close. Gap-fill (interpolated) and non-regular-session bars are dropped."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise EntryError("the Robinhood file for %s is not JSON" % sym)
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    results = data.get("results") if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        raise EntryError("the Robinhood file for %s has no results: save get_equity_historicals output as returned" % sym)
+    r = next((x for x in results if isinstance(x, dict) and str(x.get("symbol") or "").upper() == sym), None)
+    if r is None:
+        raise EntryError("the Robinhood file holds %s, not %s" % (
+            ", ".join(str(x.get("symbol")) for x in results if isinstance(x, dict)) or "no symbol", sym))
+    gran = RH_INTERVALS.get(str(r.get("interval") or ""))
+    if gran is None:
+        raise EntryError("the Robinhood bars for %s are %s: request interval 5minute or minute" % (sym, r.get("interval")))
+    bars = []
+    for b in r.get("bars") or []:
+        if b.get("interpolated") or (b.get("session") and b["session"] != "reg") or b.get("close_price") is None:
+            continue
+        try:
+            bars.append({"t": rh_time(b["begins_at"]), "o": float(b["open_price"]), "h": float(b["high_price"]),
+                         "l": float(b["low_price"]), "c": float(b["close_price"]), "v": int(b.get("volume") or 0)})
+        except (KeyError, TypeError, ValueError):
+            raise EntryError("a Robinhood bar for %s is malformed: %r" % (sym, b))
+    bars.sort(key=lambda x: x["t"])
+    return {"symbol": sym, "meta": {"symbol": sym, "dataGranularity": gran}, "bars": bars, "prev_close": None,
+            "data_time": (bars[-1]["t"] + INTERVALS[gran]) if bars else None, "source": "robinhood"}
+
+
+def sniff_source(text):
+    """Which kind of saved file this is: "yahoo" (chart JSON) or "robinhood"."""
+    head = text.lstrip()[:4000]
+    if '"chart"' in head:
+        return "yahoo"
+    if '"begins_at"' in text or '"results"' in head:
+        return "robinhood"
+    return "yahoo"
+
+
 def read_text(path):
     if path.endswith(".gz"):
         with gzip.open(path, "rt", encoding="utf-8") as fh:
@@ -351,9 +414,13 @@ def offline_file(path, sym):
     return path
 
 
-def get_chart(sym, interval, day=None, offline=None, today=None):
-    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file."""
+def get_chart(sym, interval, day=None, offline=None, today=None, source=None):
+    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file:
+    a Yahoo chart JSON or the Robinhood connector's bars (--source robinhood)."""
     sym = sym.upper()
+    if source == "robinhood" and not offline:
+        raise EntryError("--source robinhood reads bars saved from the Robinhood connector "
+                         "(get_equity_historicals, interval 5minute): give --offline FILE or a folder of <TICKER>.json")
     if offline:
         f = offline_file(offline, sym)
         try:
@@ -363,7 +430,17 @@ def get_chart(sym, interval, day=None, offline=None, today=None):
     else:
         today = today or to_eastern(utc_now()).date()
         text = yahoo_get(chart_path(sym, chart_range(day or today, today, interval), interval))
+    kind = sniff_source(text) if offline else "yahoo"
+    if source and kind != source:
+        raise EntryError("%s holds %s data, not %s" % (offline, SOURCE_NAME[kind], SOURCE_NAME[source]))
+    if kind == "robinhood":
+        ch = parse_robinhood(text, sym)
+        if ch["meta"]["dataGranularity"] != interval:
+            raise EntryError("%s has %s bars, not %s: use --interval %s" % (
+                sym, ch["meta"]["dataGranularity"], interval, ch["meta"]["dataGranularity"]))
+        return ch
     ch = parse_chart(text, sym)
+    ch["source"] = "yahoo"
     if ch["symbol"] != yahoo_symbol(sym):
         raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
     gran = ch["meta"].get("dataGranularity")
@@ -425,7 +502,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
-           "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS, "_bars": []}
+           "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS, "_bars": [],
+           "source": chart.get("source") or "yahoo"}
+    src = SOURCE_NAME.get(res["source"], res["source"])
     dt = chart.get("data_time")
     res["data_time"] = to_eastern(utc_of(dt)).strftime("%Y-%m-%d %H:%M:%S") if dt else None
     ok, why = trading_day(day)
@@ -466,9 +545,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             else:
                 pending = b
                 res["forming"] = {"bar_start": hm(b["et"]), "closes": ampm(b["end"]), "price": r2(b["c"])}
-                res["lag_note"] = ("Yahoo's last trade is %s, before the %s bar's close: it counts once Yahoo "
-                                   "catches up (a minute at most)" % (to_eastern(utc_of(dt)).strftime("%H:%M:%S"),
-                                                                       short(b["et"])))
+                res["lag_note"] = ("%s's last trade is %s, before the %s bar's close: it counts once %s "
+                                   "catches up (a minute at most)" % (src, to_eastern(utc_of(dt)).strftime("%H:%M:%S"),
+                                                                       short(b["et"]), src))
         elif b["et"] <= local:
             res["forming"] = {"bar_start": hm(b["et"]), "closes": ampm(b["end"]), "price": r2(b["c"])}
     res["_bars"] = bars
@@ -491,7 +570,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 len(or_bars), n_or, short(or_end)))
             return res
         if not or_bars:
-            res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
+            res.update(status="no-data", phase="open", reason="%s sent no bars for the opening range" % src)
             return res
         lvl = max(b["h"] for b in or_bars)
     else:
@@ -524,11 +603,11 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
         if dt and utc_of(dt) < eastern_to_utc(trig["end"]):
-            res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a cent or two"
-                                % to_eastern(utc_of(dt)).strftime("%H:%M:%S"))
+            res["data_note"] = ("%s's last trade is %s, before this bar closed: its close can still move a cent or two"
+                                % (src, to_eastern(utc_of(dt)).strftime("%H:%M:%S")))
         return res
     if not bars:
-        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
+        res.update(status="no-data", phase="open", reason="%s sent no bars for %s yet" % (src, day.isoformat()))
         return res
     what = "close above the range high $%.2f" % lvl if setup == "orb" else "close above $%.2f" % lvl
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
@@ -566,7 +645,7 @@ def entry_doc(res, now_utc):
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": res.get("source") or "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
 
 
 def write_json(path, doc):
@@ -595,8 +674,9 @@ def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
     bars = "5-minute" if res["interval"] == "5m" else "1-minute"
-    head = "%s  %s %s ET  %s on %s bars (Yahoo, free, can lag)" % (
-        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
+    head = "%s  %s %s ET  %s on %s bars (%s)" % (
+        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars,
+        SOURCES.get(res.get("source") or "yahoo", res.get("source")))
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -798,10 +878,10 @@ def _load(a, sym, now):
     """(chart, now). An offline file without --now is read as of its own time."""
     real_today = to_eastern(utc_now()).date()
     if a.offline and now is None:
-        ch = get_chart(sym, a.interval, offline=a.offline)
+        ch = get_chart(sym, a.interval, offline=a.offline, source=a.source)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
     now = now or utc_now()
-    return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today), now
+    return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today, a.source), now
 
 
 def cmd_check(a):
@@ -839,7 +919,7 @@ def cmd_watch(a):
     real_today = to_eastern(utc_now()).date()
 
     def provider(now):
-        return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today)
+        return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today, a.source)
 
     until = None
     if a.until:
@@ -907,7 +987,8 @@ def cmd_watchlist(a):
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
-        print("Free Yahoo bars, unofficial and can lag. Nothing was placed.")
+        print("Robinhood bars saved from the connector. Nothing was placed." if a.source == "robinhood"
+              else "Free Yahoo bars, unofficial and can lag. Nothing was placed.")
     return 0 if any(r and r["status"] == "triggered" for _, r, _ in rows) else 1
 
 
@@ -923,7 +1004,11 @@ def main(argv=None):
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
-        p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
+        p.add_argument("--offline", metavar="PATH",
+                       help="saved Yahoo chart JSON or Robinhood bars (.json/.json.gz), or a folder of <TICKER>.json")
+        p.add_argument("--source", choices=["yahoo", "robinhood"],
+                       help="robinhood: read --offline bars saved from the Robinhood connector (default: Yahoo live, "
+                            "or whatever the --offline file holds)")
         p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("check", help="the setup's status right now")

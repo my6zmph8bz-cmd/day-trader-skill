@@ -603,3 +603,102 @@ class SkillDoc(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+RH_TSLA = os.path.join(EDIR, "robinhood-TSLA-2026-11-13-5m.json")
+
+
+def yahoo_to_robinhood(path, interpolate_at=None):
+    """The reel's Yahoo bars in the shape the Robinhood connector returns them."""
+    with open(path, encoding="utf-8") as fh:
+        r = json.load(fh)["chart"]["result"][0]
+    q = r["indicators"]["quote"][0]
+    bars = []
+    for i, t in enumerate(r["timestamp"]):
+        if q["close"][i] is None or t % 300:
+            continue
+        bars.append({"begins_at": datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     "open_price": "%.6f" % q["open"][i], "close_price": "%.6f" % q["close"][i],
+                     "high_price": "%.6f" % q["high"][i], "low_price": "%.6f" % q["low"][i],
+                     "volume": q["volume"][i] or 0, "session": "reg"})
+    if interpolate_at is not None:   # a gap-fill bar that must be ignored
+        b = dict(bars[interpolate_at], close_price="999.000000", high_price="999.000000", interpolated=True)
+        bars.insert(interpolate_at, b)
+    return {"data": {"results": [{"symbol": "TSLA", "interval": "5minute", "bounds": "regular", "bars": bars}]},
+            "guide": "..."}
+
+
+class Robinhood(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def save(self, doc, name="TSLA.json"):
+        p = os.path.join(self.d, name)
+        with open(p, "w") as fh:
+            json.dump(doc, fh)
+        return p
+
+    def test_same_trigger_as_yahoo(self):
+        rh = self.save(yahoo_to_robinhood(TSLA, interpolate_at=8))
+        code, out, err = run(["check", "TSLA", "--offline", rh, "--source", "robinhood", "--now", "2026-10-19 10:15",
+                              "--json"])
+        self.assertEqual(code, 0, err)
+        r = json.loads(out)
+        self.assertEqual(r["source"], "robinhood")
+        self.assertEqual(r["opening_range"]["high"], 362.18)
+        self.assertEqual(r["opening_range"]["low"], 354.47)
+        self.assertEqual(r["trigger"]["time"], "10:15 AM")
+        self.assertEqual(r["trigger"]["price"], 364.18)
+
+    def test_label_and_entry_json_name_robinhood(self):
+        rh = self.save(yahoo_to_robinhood(TSLA))
+        out_path = os.path.join(self.d, "entry.json")
+        code, out, _ = run(["check", "TSLA", "--offline", rh, "--source", "robinhood", "--now", "2026-10-19 10:15",
+                            "--write", out_path])
+        self.assertEqual(code, 0)
+        self.assertIn("(Robinhood bars saved from the connector)", out)
+        self.assertNotIn("Yahoo", out)
+        with open(out_path) as fh:
+            self.assertEqual(json.load(fh)["source"], "robinhood")
+
+    def test_a_saved_robinhood_file_is_recognised_without_the_flag(self):
+        code, out, _ = run(["check", "TSLA", "--offline", RH_TSLA, "--now", "2026-11-13 10:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("Opening range 9:30-9:45: high $404.40, low $388.03 (3 of 3 bars).", out)
+        self.assertIn("WAITING", out)
+        self.assertIn("$13.46 under the range high $404.40", out)
+        self.assertIn("Robinhood", out)
+        # read as of its own time: the last bar (9:55) closes at 10:00
+        code, out, _ = run(["check", "TSLA", "--offline", RH_TSLA, "--json"])
+        self.assertEqual(json.loads(out)["now"], "2026-11-13 10:00:00")
+
+    def test_refusals(self):
+        code, _, err = run(["check", "TSLA", "--source", "robinhood", "--now", "2026-11-13 10:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("give --offline FILE", err)
+        code, _, err = run(["check", "TSLA", "--offline", TSLA, "--source", "robinhood", "--now", "2026-10-19 10:15"])
+        self.assertIn("holds Yahoo data, not Robinhood", err)
+        code, _, err = run(["check", "NVDA", "--offline", RH_TSLA, "--now", "2026-11-13 10:00"])
+        self.assertIn("holds TSLA, not NVDA", err)
+        code, _, err = run(["check", "TSLA", "--offline", RH_TSLA, "--interval", "1m", "--now", "2026-11-13 10:00"])
+        self.assertIn("has 5m bars, not 1m", err)
+        doc = yahoo_to_robinhood(TSLA)
+        doc["data"]["results"][0]["interval"] = "hour"
+        code, _, err = run(["check", "TSLA", "--offline", self.save(doc), "--now", "2026-10-19 10:15"])
+        self.assertIn("request interval 5minute or minute", err)
+        for e in (err,):
+            self.assertNotIn("Traceback", e)
+
+    def test_watch_replays_robinhood_bars(self):
+        rh = self.save(yahoo_to_robinhood(TSLA))
+        out_path = os.path.join(self.d, "entry.json")
+        code, out, err = run(["watch", "TSLA", "--offline", rh, "--source", "robinhood", "--now", "2026-10-19 09:50",
+                              "--out", out_path])
+        self.assertEqual(code, 0, err)
+        self.assertIn("TRIGGERED", out)
+        with open(out_path) as fh:
+            doc = json.load(fh)
+        self.assertEqual((doc["time"], doc["price"], doc["source"]), ("10:15 AM", 364.18, "robinhood"))

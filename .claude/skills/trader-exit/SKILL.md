@@ -47,6 +47,12 @@ level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop).
 | Yahoo chart API | only for an `atr:K` stop: the session's bars up to the entry bar, free and unofficial |
 | `trader/plan.json` | with `--write`: entry, stop and its rule, target and its R, risk a share, reward:risk, flat by. trader-timemachine, trader-budget and trader-alerts read it |
 
+For an `atr:K` stop on Robinhood bars, save the connector's
+`get_equity_historicals` output for the session (interval `5minute` or
+`minute`, matching the entry) as returned, then `exit.py plan --stop atr:1.5
+--source robinhood --offline trader/rh/TSLA.json`. The plan records
+`atr_source`. Read-only: never call a Robinhood order tool from here.
+
 ## Stops and targets
 
 | stop | where it goes |

@@ -37,6 +37,10 @@ Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
           request per ticker, half a second apart; the default)
   stooq   https://stooq.com/q/l/?s=tsla.us&f=sd2t2ohlcv&h&e=csv (Stooq's free
           CSV; it answered 404 on 2026-10-13, kept for when it is back)
+  robinhood  quotes saved from the Robinhood connector (get_equity_quotes, as
+          returned). Needs --offline: a folder of robinhood-<TICKER>.json, or one
+          file holding every ticker. The price is the newer of the last regular
+          and the last extended-hours trade; prev_close is adjusted_previous_close.
   --offline DIR reads DIR/<source>-<TICKER>.json|csv (or .json.gz) instead.
 
 NYSE calendar: the 2026 and 2027 holidays and 1:00 p.m. early closes as
@@ -246,6 +250,46 @@ def parse_yahoo(text, sym):
             "currency": m.get("currency"), "source": "yahoo"}
 
 
+def parse_robinhood(text, sym):
+    """The Robinhood connector's get_equity_quotes output, saved as returned
+    ({"data": {"results": [{"quote": {...}, "close": {...}}]}}) -> quote."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise AlertError("the Robinhood quote file for %s is not JSON" % sym)
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    results = data.get("results") if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        raise AlertError("the Robinhood quote file has no results: save get_equity_quotes output as returned")
+    q = None
+    for r in results:
+        cand = (r or {}).get("quote") if isinstance(r, dict) and "quote" in r else r
+        if isinstance(cand, dict) and str(cand.get("symbol") or "").upper() == sym.upper():
+            q = cand
+            break
+    if q is None:
+        raise AlertError("the Robinhood quote file has no %s" % sym.upper())
+    if q.get("has_traded") is False or (q.get("state") and q["state"] != "active"):
+        raise AlertError("Robinhood says %s is %s%s: no live price" % (
+            sym.upper(), q.get("state") or "inactive", "" if q.get("has_traded", True) else ", not traded"))
+    picks = [(q.get("venue_last_trade_time") or "", q.get("last_trade_price")),
+             (q.get("venue_last_non_reg_trade_time") or "", q.get("last_non_reg_trade_price"))]
+    picks = [p for p in picks if p[1] not in (None, "")]
+    if not picks:
+        raise AlertError("Robinhood has no price for %s" % sym.upper())
+    when, price = max(picks, key=lambda p: p[0])      # ISO UTC strings sort by time
+
+    def f(v):
+        try:
+            return float(v) if v not in (None, "") else None
+        except ValueError:
+            return None
+    return {"symbol": sym.upper(), "price": float(price), "open": None, "high": None, "low": None,
+            "prev_close": f(q.get("adjusted_previous_close")) or f(q.get("previous_close")),
+            "time": re.sub(r"\.\d+Z$", "Z", when), "source": "robinhood"}
+
+
 _urlopen = urllib.request.urlopen   # tests swap these two
 _sleep = time.sleep
 
@@ -299,6 +343,9 @@ def fetch_yahoo(sym, timeout=20):
 
 
 def _offline_text(folder, source, sym):
+    if source == "robinhood" and os.path.isfile(folder):     # one saved get_equity_quotes for every ticker
+        with open(folder, encoding="utf-8") as fh:
+            return fh.read()
     ext = "csv" if source == "stooq" else "json"
     base = os.path.join(folder, "%s-%s.%s" % (source, sym, ext))
     if os.path.exists(base):
@@ -313,6 +360,10 @@ def _offline_text(folder, source, sym):
 def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
     """{SYM: quote} and [errors]. One request per ticker, with a pause between."""
     quotes, errors = {}, []
+    if source == "robinhood" and not offline:
+        raise AlertError("--source robinhood reads quotes saved from the Robinhood connector (get_equity_quotes): "
+                         "give --offline FILE, or a folder of robinhood-<TICKER>.json")
+    parse = {"stooq": parse_stooq, "robinhood": parse_robinhood}.get(source, parse_yahoo)
     for i, sym in enumerate(symbols):
         sym = sym.upper()
         try:
@@ -322,7 +373,7 @@ def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
                 if i and pause:
                     _sleep(pause)
                 text = fetch(stooq_url(sym)) if source == "stooq" else fetch_yahoo(sym)
-            quotes[sym] = parse_stooq(text, sym) if source == "stooq" else parse_yahoo(text, sym)
+            quotes[sym] = parse(text, sym)
         except AlertError as e:
             errors.append(str(e))
     return quotes, errors
@@ -581,7 +632,10 @@ def cmd_quote(a):
             print("error: " + e)
         if a.write and quotes:
             print("Wrote %d price(s) to %s." % (len(quotes), a.write))
-        print("Quotes are free, delayed and unofficial: for alerts only. Your broker's price is the one that fills.")
+        if a.source == "robinhood":
+            print("Robinhood quotes saved from the connector, as of the time shown: for alerts only. The fill is what counts.")
+        else:
+            print("Quotes are free, delayed and unofficial: for alerts only. Your broker's price is the one that fills.")
     return 0 if quotes else 1
 
 
@@ -720,8 +774,10 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
-        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq"])
-        p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
+        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq", "robinhood"],
+                       help="robinhood: quotes saved from the Robinhood connector, read with --offline")
+        p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network "
+                                                        "(robinhood: also one saved file for every ticker)")
         p.add_argument("--now", help="pretend it is this time (no offset = New York time)")
         p.add_argument("--json", action="store_true")
 

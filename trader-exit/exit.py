@@ -408,8 +408,56 @@ def read_text(path):
         return fh.read()
 
 
-def load_chart(sym, interval, day, offline=None):
+RH_INTERVALS = {"5minute": "5m", "minute": "1m"}
+
+
+def rh_time(text):
+    """Robinhood's begins_at ("2026-11-13T14:30:00Z") -> epoch seconds."""
+    t = str(text).strip().replace("Z", "+00:00")
+    if "." in t:                                  # trim nanoseconds to what fromisoformat takes
+        head, rest = t.split(".", 1)
+        frac = re.match(r"\d*", rest).group(0)
+        t = head + "." + frac[:6].ljust(6, "0") + rest[len(frac):]
+    d = datetime.datetime.fromisoformat(t)
+    if d.tzinfo is not None:
+        d = (d - d.utcoffset()).replace(tzinfo=None)
+    return int((d - EPOCH).total_seconds())
+
+
+def robinhood_chart(data, sym, interval):
+    """The Robinhood connector's get_equity_historicals output, saved as returned
+    -> {"bars", "data_time", "source"}. Gap-fill and non-regular bars are dropped."""
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    results = data.get("results") if isinstance(data, dict) else data
+    if not isinstance(results, list):
+        raise PlanError("the Robinhood file for %s has no results: save get_equity_historicals output as returned" % sym)
+    r = next((x for x in results if isinstance(x, dict) and str(x.get("symbol") or "").upper() == sym.upper()), None)
+    if r is None:
+        raise PlanError("the Robinhood file holds %s, not %s" % (
+            ", ".join(str(x.get("symbol")) for x in results if isinstance(x, dict)) or "no symbol", sym))
+    gran = RH_INTERVALS.get(str(r.get("interval") or ""))
+    if gran != interval:
+        raise PlanError("the Robinhood bars for %s are %s: the entry is on %s bars (request interval %s)" % (
+            sym, r.get("interval"), interval, "5minute" if interval == "5m" else "minute"))
+    bars = []
+    for b in r.get("bars") or []:
+        if b.get("interpolated") or (b.get("session") and b["session"] != "reg") or b.get("close_price") is None:
+            continue
+        try:
+            bars.append({"t": rh_time(b["begins_at"]), "h": float(b["high_price"]), "l": float(b["low_price"]),
+                         "c": float(b["close_price"])})
+        except (KeyError, TypeError, ValueError):
+            raise PlanError("a Robinhood bar for %s is malformed: %r" % (sym, b))
+    bars.sort(key=lambda x: x["t"])
+    return {"bars": bars, "data_time": (bars[-1]["t"] + INTERVALS[gran]) if bars else None, "source": "robinhood"}
+
+
+def load_chart(sym, interval, day, offline=None, source=None):
     ysym = sym.upper().replace(".", "-")
+    if source == "robinhood" and not offline:
+        raise PlanError("--source robinhood reads bars saved from the Robinhood connector "
+                        "(get_equity_historicals): give --offline FILE")
     if offline:
         path = offline
         if os.path.isdir(offline):
@@ -430,8 +478,18 @@ def load_chart(sym, interval, day, offline=None):
         text = yahoo_get("/v8/finance/chart/%s?range=%s&interval=%s" % (ysym, rng, interval))
     try:
         data = json.loads(text)
+    except ValueError:
+        raise PlanError("%s returned something that is not JSON for %s" % ("Robinhood" if source == "robinhood" else "Yahoo", sym))
+    kind = "yahoo" if isinstance(data, dict) and "chart" in data else "robinhood"
+    if not offline:
+        kind = "yahoo"
+    if source and kind != source:
+        raise PlanError("%s holds %s data, not %s" % (offline, kind.capitalize(), source.capitalize()))
+    if kind == "robinhood":
+        return robinhood_chart(data, sym, interval)
+    try:
         res = data["chart"]["result"]
-    except (ValueError, KeyError, TypeError):
+    except (KeyError, TypeError):
         raise PlanError("Yahoo returned something unexpected for %s" % sym)
     if not res:
         err = (data.get("chart") or {}).get("error") or {}
@@ -454,7 +512,7 @@ def load_chart(sym, interval, day, offline=None):
         h, lo = at("high", i), at("low", i)
         bars.append({"t": int(t), "h": float(c if h is None else h), "l": float(c if lo is None else lo),
                      "c": float(c)})
-    return {"bars": bars, "data_time": meta.get("regularMarketTime")}
+    return {"bars": bars, "data_time": meta.get("regularMarketTime"), "source": "yahoo"}
 
 
 def session_bars(chart, day, interval, upto_slot=None, now_utc=None):
@@ -600,14 +658,15 @@ def build_plan(a, now_utc):
     else:
         day = to_eastern(now_utc).date()
     entry_time = parse_clock(info["entry_time"], "the entry time") if info["entry_time"] else None
-    atr = atr_n = None
+    atr = atr_n = atr_source = None
     if stop_rule == "atr":
-        chart = load_chart(info["symbol"], info["interval"], day, a.offline)
+        chart = load_chart(info["symbol"], info["interval"], day, a.offline, a.source)
         bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None)
         if len(bars) < 3:
             raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
                             % (info["interval"], info["symbol"], day, len(bars)))
         atr, atr_n = atr_of(bars)
+        atr_source = chart.get("source") or "yahoo"
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
                 atr, atr_n)
     flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
@@ -632,6 +691,7 @@ def build_plan(a, now_utc):
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
+        plan["atr_source"] = atr_source
     warnings = []
     shut = closed_reason(day)
     if shut:
@@ -741,7 +801,9 @@ def main(argv=None):
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM New York (default: config flat_by, 15:55)")
     p.add_argument("--config", default="trader/config.json")
-    p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
+    p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON or Robinhood bars for an atr stop")
+    p.add_argument("--source", choices=["yahoo", "robinhood"],
+                   help="robinhood: the atr stop reads --offline bars saved from the Robinhood connector")
     p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")

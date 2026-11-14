@@ -203,6 +203,38 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("at least 3 closed", err)
 
+    def test_atr_stop_reads_robinhood_bars(self):
+        # the same reel bars in the Robinhood connector's shape give the same ATR stop
+        with open(TSLA, encoding="utf-8") as fh:
+            r = json.load(fh)["chart"]["result"][0]
+        q = r["indicators"]["quote"][0]
+        import datetime
+        bars = [{"begins_at": datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "open_price": str(q["open"][i]), "high_price": str(q["high"][i]), "low_price": str(q["low"][i]),
+                 "close_price": str(q["close"][i]), "volume": q["volume"][i] or 0, "session": "reg"}
+                for i, t in enumerate(r["timestamp"]) if q["close"][i] is not None and t % 300 == 0]
+        bars.insert(3, dict(bars[3], high_price="999", interpolated=True))       # gap-fill: ignored
+        rh = {"data": {"results": [{"symbol": "TSLA", "interval": "5minute", "bars": bars}]}, "guide": "..."}
+        self.write("rh.json", rh)
+        self.write(os.path.join("trader", "entry.json"), REEL_ENTRY)
+        code, text, err = self.plan("--stop", "atr:1.5", "--offline", "rh.json", "--source", "robinhood", "--json")
+        self.assertEqual(code, 0, err)
+        p = json.loads(text)
+        self.assertEqual((p["stop"], p["risk_per_share"], p["target"]), (359.35, 4.83, 373.84))
+        self.assertEqual((p["atr_bars"], p["atr_source"]), (9, "robinhood"))
+        code, text, _ = self.plan("--stop", "atr:1.5", "--offline", TSLA, "--json")
+        self.assertEqual(json.loads(text)["atr_source"], "yahoo")
+        # refusals: no file, the wrong kind of file, the wrong bar size
+        code, _, err = self.plan("--stop", "atr:1.5", "--source", "robinhood")
+        self.assertIn("give --offline FILE", err)
+        code, _, err = self.plan("--stop", "atr:1.5", "--offline", TSLA, "--source", "robinhood")
+        self.assertIn("holds Yahoo data, not Robinhood", err)
+        rh["data"]["results"][0]["interval"] = "minute"
+        self.write("rh.json", rh)
+        code, _, err = self.plan("--stop", "atr:1.5", "--offline", "rh.json")
+        self.assertIn("request interval 5minute", err)
+        self.assertNotIn("Traceback", err)
+
     def test_refusals_from_the_cli(self):
         self.write(os.path.join("trader", "entry.json"), dict(REEL_ENTRY, status="waiting", time=None, price=None,
                                                               bar_index=None, bar_start=None))

@@ -85,6 +85,19 @@ close, so "flat by close" at 15:55 rings at 12:55 on those days.
   `get_stock_snapshot`, IBKR `get_price_snapshot`) and write it into
   `trader/prices.json` as `{"as_of": "...Z", "prices": {"TSLA": 366.48}}`.
 
+### Robinhood quotes (`--source robinhood`)
+
+When Yahoo lags, Claude calls the Robinhood connector's `get_equity_quotes`
+for the tickers (read-only, never an order tool), saves the result as
+returned to `trader/rh/quotes.json`, then runs `alerts.py check --source
+robinhood --offline trader/rh/quotes.json` (or `quote ... --source robinhood
+--offline ...`). One file can hold every ticker; a folder of
+`robinhood-<TICKER>.json` also works. The price is the newer of the last
+regular and the last extended-hours trade; the previous close is
+`adjusted_previous_close`. A halted or untraded ticker is an error, not a
+price. Fetch and save again before each check: the file does not refresh
+itself.
+
 ## The NYSE clock
 
 Regular session 9:30 a.m. to 4:00 p.m. New York time, closed on weekends and

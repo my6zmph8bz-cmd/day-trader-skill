@@ -50,6 +50,24 @@ day bar by bar without waiting.
 | Yahoo chart API | today's bars, `range=1d&interval=5m` (or `1m`): free, unofficial, can lag |
 | `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range |
 
+## Robinhood bars (`--source robinhood`)
+
+When Yahoo lags, Claude can read the bars from the user's Robinhood connector
+instead. The script cannot call the connector, so Claude does it:
+
+1. Call `get_equity_historicals` with `symbols: ["TSLA"]`, `interval:
+   "5minute"` (or `"minute"` for `--interval 1m`), `start_time` today's 9:30
+   New York time in UTC (`14:30:00Z` in winter, `13:30:00Z` in summer) and
+   no `end_time`. Read-only: never call a Robinhood order tool from here.
+2. Save the result exactly as returned to `trader/rh/TSLA.json`.
+3. Run `entry.py check TSLA --source robinhood --offline trader/rh/TSLA.json`.
+
+Robinhood returns only completed bars, so the data runs to the last bar's
+close; gap-fill (`interpolated`) and extended-hours bars are dropped. The
+output and `trader/entry.json` say `robinhood`. A file that holds Yahoo data,
+another ticker or another bar size is refused. To keep watching, fetch and
+save again each bar (a `/loop 5m`); `watch` only replays a saved file.
+
 ## The rule
 
 - **Opening range (orb).** The high and low of the first 15 minutes: the
