@@ -702,3 +702,29 @@ class Robinhood(unittest.TestCase):
         with open(out_path) as fh:
             doc = json.load(fh)
         self.assertEqual((doc["time"], doc["price"], doc["source"]), ("10:15 AM", 364.18, "robinhood"))
+
+
+class SavedFileEnds(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def test_watch_stops_at_the_end_of_saved_bars(self):
+        out_path = os.path.join(self.d, "e.json")
+        code, text, _ = run(["watch", "TSLA", "--offline", RH_TSLA, "--source", "robinhood", "--out", out_path])
+        self.assertEqual(code, 1)
+        self.assertIn("END OF SAVED BARS  the file runs to 10:00 ET with no trigger yet", text)
+        self.assertNotIn("EXPIRED", text)
+        self.assertFalse(os.path.exists(out_path))
+
+    def test_a_real_expiry_inside_the_file_still_says_expired(self):
+        cfg = os.path.join(self.d, "config.json")
+        with open(cfg, "w") as fh:
+            json.dump({"no_entries_after": "09:55"}, fh)
+        code, text, _ = run(["watch", "TSLA", "--offline", RH_TSLA, "--config", cfg, "--out",
+                             os.path.join(self.d, "e.json")])
+        self.assertEqual(code, 1)
+        self.assertIn("EXPIRED", text)
+        self.assertNotIn("END OF SAVED BARS", text)

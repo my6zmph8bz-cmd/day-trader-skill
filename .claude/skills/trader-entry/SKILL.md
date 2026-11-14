@@ -66,7 +66,8 @@ Robinhood returns only completed bars, so the data runs to the last bar's
 close; gap-fill (`interpolated`) and extended-hours bars are dropped. The
 output and `trader/entry.json` say `robinhood`. A file that holds Yahoo data,
 another ticker or another bar size is refused. To keep watching, fetch and
-save again each bar (a `/loop 5m`); `watch` only replays a saved file.
+save again each bar (a `/loop 5m`). `watch` on a saved file replays it and
+stops at its last bar with END OF SAVED BARS, which is not an expiry.
 
 ## The rule
 

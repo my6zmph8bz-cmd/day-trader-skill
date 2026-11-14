@@ -772,8 +772,10 @@ class SimClock(object):
         self.t += datetime.timedelta(seconds=max(1, int(round(seconds))))
 
 
-def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_errors=5, on_trigger=None):
-    """Poll bar by bar until a trigger (0), expiry, the close or --until (1).
+def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_errors=5, on_trigger=None,
+               data_end=None):
+    """Poll bar by bar until a trigger (0), expiry, the close, --until or the end
+    of a saved file's bars (data_end, naive UTC) (1).
     provider(now_utc) -> chart, clock() -> naive UTC, sleep(seconds), emit(line).
     It sleeps in steps of at most `every` seconds and re-reads the clock each time,
     so a computer that dozed off catches up as soon as it wakes."""
@@ -837,6 +839,15 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
             if on_trigger:
                 on_trigger(res, now)
             return 0, res
+        if data_end is not None and now >= data_end + datetime.timedelta(seconds=step):
+            # a saved file has no bars past data_end: past it, silence is not an expiry
+            at_end = evaluate(chart, data_end, **opts)
+            if at_end["status"] != "expired":
+                emit("END OF SAVED BARS  the file runs to %s ET with no trigger yet; this is not an expiry. "
+                     "Save fresh bars and run again." % to_eastern(data_end).strftime("%H:%M"))
+                return 1, res
+            emit("EXPIRED  %s." % (at_end["reason"] or "the market closed without a trigger"))
+            return 1, res
         if res["status"] == "expired" or local >= close_dt:
             emit("EXPIRED  %s." % (res["reason"] or "the market closed without a trigger"))
             return 1, res
@@ -909,6 +920,10 @@ def cmd_watch(a):
     if a.every <= 0:
         raise EntryError("--every must be above 0 seconds")
     start = parse_now(a.now) if a.now else None
+    data_end = None
+    if a.offline:
+        first = get_chart(sym, a.interval, offline=a.offline, source=a.source)
+        data_end = utc_of(first["data_time"]) if first.get("data_time") else None
     if a.offline or start is not None:
         if start is None:
             start = _load(a, sym, None)[1]
@@ -934,7 +949,7 @@ def cmd_watch(a):
         print(line, flush=True)
 
     code, _ = watch_loop(provider, now_fn, sleep_fn, emit, opts, every=a.every, until=until,
-                         on_trigger=on_trigger)
+                         on_trigger=on_trigger, data_end=data_end)
     return code
 
 
