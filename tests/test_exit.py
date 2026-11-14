@@ -264,6 +264,43 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no time left to hold it", err)
 
+    def test_typed_entry_after_flat_by_uses_the_clock(self):
+        base = ["plan", "--symbol", "NVDA", "--entry", "190", "--stop", "pct:1"]
+        # no --time: the clock (--now) is the entry time, so 15:56 on a trading day is too late
+        code, _, err = run(exitp, base + ["--now", "2026-11-16 15:56"])
+        self.assertEqual(code, 1)
+        self.assertIn("at or after your flat-by 15:55", err)
+        self.assertIn("--date 2026-11-17", err)
+        code, _, err = run(exitp, base + ["--now", "2026-11-16 15:55"])
+        self.assertEqual(code, 1)
+        # 1:00 p.m. early close: flat-by moves to 12:55, and 13:30 is past it
+        code, _, err = run(exitp, base + ["--now", "2026-11-27 13:30"])
+        self.assertEqual(code, 1)
+        self.assertIn("flat-by 12:55", err)
+        self.assertIn("--date 2026-11-30", err)
+        # earlier in the day is fine, and so is planning another day ahead at 15:56
+        code, _, _ = run(exitp, base + ["--now", "2026-11-16 15:54"])
+        self.assertEqual(code, 0)
+        code, _, _ = run(exitp, base + ["--now", "2026-11-16 15:56", "--date", "2026-11-17"])
+        self.assertEqual(code, 0)
+        # an explicit --time still decides on its own
+        code, _, _ = run(exitp, base + ["--now", "2026-11-16 15:56", "--time", "10:15", "--date", "2026-11-16"])
+        self.assertEqual(code, 0)
+
+    def test_non_trading_day_warns(self):
+        base = ["plan", "--symbol", "NVDA", "--entry", "190", "--stop", "pct:1", "--json"]
+        code, text, _ = run(exitp, base + ["--now", "2026-11-14 07:36"])           # a Saturday
+        self.assertEqual(code, 0)
+        w = json.loads(text)["warnings"]
+        self.assertIn("Sat 2026-11-14 is not a trading day (weekend)", w[0])
+        self.assertIn("--date 2026-11-16", w[0])
+        code, text, _ = run(exitp, base + ["--now", "2026-11-20 10:00", "--date", "2026-11-26"])   # Thanksgiving
+        w = json.loads(text)["warnings"]
+        self.assertIn("not a trading day (Thanksgiving Day)", w[0])
+        self.assertIn("The next session is Fri 2026-11-27", w[0])
+        code, text, _ = run(exitp, base + ["--now", "2026-11-16 10:00"])           # a Monday: no warning
+        self.assertEqual(json.loads(text)["warnings"], [])
+
     def test_show_without_a_plan(self):
         code, text, _ = run(exitp, ["show"])
         self.assertEqual(code, 1)

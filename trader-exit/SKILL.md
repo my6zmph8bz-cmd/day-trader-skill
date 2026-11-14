@@ -68,7 +68,12 @@ A level setup has no opening range to lean on, so it needs a stop you name.
   triggered (unless you give `--entry`). A short: v2 plans longs only.
 - **Flat by.** 15:55 by default (or `flat_by` in the config). Out by then,
   win or lose, no overnight hold. On a 1:00 p.m. early close it moves up to
-  12:55. An entry at or after the flat-by time is refused.
+  12:55. An entry at or after the flat-by time is refused. A price typed
+  with `--entry` and no `--time` is an entry made now: on today's session
+  it is refused once the clock (or `--now`) reaches the flat-by time. Plan
+  another day with `--date`.
+- **Closed days.** A plan for a weekend or an NYSE holiday is still written,
+  with a note that the market is closed and the `--date` of the next session.
 
 ## Steps
 

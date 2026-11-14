@@ -31,6 +31,9 @@ plans longs only).
 
 flat_by (default 15:55, or "flat_by" in trader/config.json): out by then, win
 or lose. On a 1:00 p.m. early close it moves up with the close (12:55).
+An entry at or after it is refused; a typed --entry with no --time counts as
+made now, at the clock (or --now). A plan for a weekend or NYSE holiday gets a
+note naming the next session.
 "min_reward_risk" in the config (default 1.0) only warns here; trader-risk
 enforces it.
 
@@ -189,6 +192,21 @@ def session(d):
     if d.weekday() >= 5 or d.isoformat() in NYSE_HOLIDAYS:
         return None
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
+
+
+def closed_reason(d):
+    """Why the NYSE is shut all day on d ("weekend", a holiday's name), or "" when it trades."""
+    if d.weekday() >= 5:
+        return "weekend"
+    return NYSE_HOLIDAYS.get(d.isoformat(), "")
+
+
+def next_session_day(d):
+    """The first trading day after d."""
+    n = d + datetime.timedelta(days=1)
+    while session(n) is None:
+        n += datetime.timedelta(days=1)
+    return n
 
 
 # ---------------------------------------------------------------- money math (Decimal, to the cent)
@@ -593,6 +611,12 @@ def build_plan(a, now_utc):
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
                 atr, atr_n)
     flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
+    now_et = to_eastern(now_utc)
+    if entry_time is None and day == now_et.date() and session(day) and now_et.time() >= parse_hhmm(flat_by, "flat_by"):
+        # a typed --entry has no time of its own: an entry made now is made at the clock (or --now)
+        raise PlanError("it is %s ET, at or after your flat-by %s: an entry now has no time left to hold it. "
+                        "Plan the next session with --date %s"
+                        % (ampm(now_et.time()), flat_by, next_session_day(day).isoformat()))
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
         orr = {"high": float(cents(info["or_high"])), "low": float(cents(info["or_low"])),
@@ -609,6 +633,12 @@ def build_plan(a, now_utc):
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
     warnings = []
+    shut = closed_reason(day)
+    if shut:
+        nxt = next_session_day(day)
+        warnings.append("%s is not a trading day (%s): the NYSE is closed. The next session is %s: "
+                        "add --date %s to plan for it."
+                        % (day.strftime("%a %Y-%m-%d"), shut, nxt.strftime("%a %Y-%m-%d"), nxt.isoformat()))
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))
     mrr = cfg.get("min_reward_risk")
