@@ -26,7 +26,7 @@ def frontmatter(path):
 
 def every_text_file():
     for base, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__")]
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "trader")]
         for f in files:
             if f.endswith((".md", ".py", ".json", ".csv", ".txt", ".xml")) or f == "LICENSE":
                 yield os.path.join(base, f)
@@ -39,8 +39,22 @@ class Repo(unittest.TestCase):
         self.assertEqual(found, sorted(SKILLS))
 
     def test_root_matches_the_reel(self):
-        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git"))
+        root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d != "trader")  # trader/ is local state, git-ignored
         self.assertEqual(root, sorted([".claude", ".claude-plugin", "LICENSE", "README.md", "tests"] + SKILLS))
+
+    def test_claude_skills_copies_match_the_root(self):
+        # .claude/skills/ holds a copy of every skill so it loads as a project skill: keep the two identical
+        import filecmp
+        copies = os.path.join(ROOT, ".claude", "skills")
+        self.assertEqual(sorted(d for d in os.listdir(copies) if not d.startswith(".")), sorted(SKILLS))
+        for s in SKILLS:
+            a, b = os.path.join(ROOT, s), os.path.join(copies, s)
+            names = sorted(f for f in os.listdir(a) if f != "__pycache__")
+            self.assertEqual(sorted(f for f in os.listdir(b) if f != "__pycache__"), names,
+                             "%s: files differ from the root copy" % s)
+            _, mismatch, errors = filecmp.cmpfiles(a, b, names, shallow=False)
+            self.assertEqual(mismatch + errors, [],
+                             "%s: .claude/skills copy is out of date; cp -r %s .claude/skills/" % (s, s))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:

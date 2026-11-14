@@ -1,0 +1,4 @@
+# your trading state: plans, orders, portfolio, news seen
+trader/
+__pycache__/
+*.pyc
